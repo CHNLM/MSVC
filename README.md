@@ -4,6 +4,7 @@ Portable Microsoft Visual C++ Compiler extract from Visual Studio Installer, inc
 ## Download
 | VC           | Windows SDK | Visual Studio      | Size   | Packing Date |
 |--------------|-------------|--------------------|--------|--------------|
+| v14.50.35717 | v10.0.26100 | Visual Studio 2026 | 142 MB | 2026/01/17   |
 | v14.40.33807 | v10.0.26100 | Visual Studio 2022 | 131 MB | 2024/07/19   |
 | v14.39.33519 | v10.0.22621 | Visual Studio 2022 | 103 MB | 2024/05/10   |
 
