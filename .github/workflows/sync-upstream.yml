@@ -2,14 +2,14 @@ name: Fork仓库同步
 
 on:
   schedule:
-    - cron: '0 0 * * 1'    #
+    - cron: '0 0 * * 1'          # 触发时间
   workflow_dispatch:              # 允许手动触发
     inputs:
       sync_mode:
         description: '同步模式选择'
         required: true
         type: choice
-        default: 'releases-only'
+        default: 'main-only'
         options:
           - 'full'                # 完整同步（所有代码分支+标签+Releases）
           - 'main-only'           # 仅同步主分支（main/master代码+标签+Releases）
@@ -78,6 +78,20 @@ jobs:
       # false = 保留所有本地分支（默认，安全）
       PRUNE_DELETED_BRANCHES: false
 
+      # 代码分支同步策略（控制如何将上游代码合并到 Fork）
+      # "merge" = git merge -X theirs（推荐）：合并保留 Fork 独有文件，与上游冲突
+      #           则以上游为准。适合绝大多数场景，你的自定义文件不会被覆盖
+      # "reset" = git reset --hard（强制行为）：完全覆盖，Fork 与上游完全一致
+      #           仅当你确定 Fork 不需要保留任何自有文件时使用
+      SYNC_STRATEGY: "merge"
+
+      # 自定义保留文件/目录路径（多个用空格分隔）
+      # 配合 merge 策略使用：merge 自动保留 Fork 独有的文件，此变量仅在 merge
+      # 出现意外故障时作为安全网回退（reset --hard → 恢复 fork 独有的文件）
+      # 也可指定单文件，如 ".github/workflows/sync-upstream.yml"
+      # 注意：GitHub Actions 不支持 .github/workflows/ 子目录存放 workflow
+      PRESERVE_PATHS: ".github/workflows/sync-upstream.yml"
+
       # ============================================================
       # 内部变量（请勿修改）
       # ============================================================
@@ -113,6 +127,14 @@ jobs:
           esac
           echo "SYNC_MODE=${EFFECTIVE_MODE}" >> "$GITHUB_ENV"
 
+          case "${{ env.SYNC_STRATEGY }}" in
+            merge|reset) ;;
+            *)
+              echo "❌ 错误：无效的同步策略 '${{ env.SYNC_STRATEGY }}'"
+              echo "💡 有效值：merge / reset"
+              exit 1 ;;
+          esac
+
           # --- 验证必要环境变量 ---
           if [ -z "${{ env.UPSTREAM_REPO }}" ] || [ "${{ env.UPSTREAM_REPO }}" = "所有者/仓库名" ]; then
             echo "❌ 错误：UPSTREAM_REPO 未配置或仍为模板默认值"
@@ -127,6 +149,11 @@ jobs:
               exit 1
             fi
           done
+
+          if [ -z "${{ env.PRESERVE_PATHS }}" ]; then
+            echo "⚠️ 警告：PRESERVE_PATHS 为空，将不会保留任何自定义文件"
+            echo "💡 如需保留自定义文件（如 workflow），请设置 PRESERVE_PATHS=\".github/workflows/\""
+          fi
 
           if [ -z "${{ secrets.SYNC_PAT }}" ]; then
             echo "❌ 错误：未找到 SYNC_PAT 令牌"
@@ -148,6 +175,8 @@ jobs:
           echo "📌 保留本地 Release 数：${{ env.KEEP_LATEST_N_RELEASES }}"
           echo "📌 同步预发布版本：     ${{ env.SYNC_PRERELEASES }}"
           echo "📌 自动清理旧版本：     ${{ env.AUTO_CLEAN_OLD_RELEASES }}"
+          echo "📌 同步策略：           ${{ env.SYNC_STRATEGY }}"
+          echo "📌 保留自定义路径：     ${{ env.PRESERVE_PATHS }}"
           echo "📌 强制覆盖分支：       ${{ env.FORCE_OVERWRITE_BRANCHES }}"
           echo "📌 清理已删除分支：     ${{ env.PRUNE_DELETED_BRANCHES }}"
           echo "=============================================="
@@ -206,6 +235,13 @@ jobs:
           REPO_PRIVATE=$(echo "${RESPONSE_BODY}"    | jq -r '.private')
           DEFAULT_BRANCH=$(echo "${RESPONSE_BODY}"  | jq -r '.default_branch')
 
+          # 验证默认分支不为空
+          if [ -z "${DEFAULT_BRANCH}" ] || [ "${DEFAULT_BRANCH}" = "null" ]; then
+            echo "❌ 错误：无法获取上游仓库默认分支"
+            echo "💡 请检查上游仓库是否存在且 PAT 权限正确"
+            exit 1
+          fi
+
           echo "REPO_FULL_NAME=${REPO_FULL_NAME}"   >> "$GITHUB_ENV"
           echo "REPO_PRIVATE=${REPO_PRIVATE}"       >> "$GITHUB_ENV"
           echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}"   >> "$GITHUB_ENV"
@@ -227,24 +263,30 @@ jobs:
           echo "=============================================="
 
           git remote remove upstream 2>/dev/null || true
-          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git remote add upstream "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ env.UPSTREAM_REPO }}.git"
 
           if [ "${{ env.SYNC_MODE }}" = "main-only" ]; then
             # ---- 主分支模式：仅 fetch 默认分支 + 所有标签 ----
             TARGET_BRANCH="${{ env.DEFAULT_BRANCH }}"
             echo "📥 获取上游默认分支（${TARGET_BRANCH}）+ 所有标签..."
             FETCH_SUCCESS=false
+            # V8 修复：添加 --force 防止 "would clobber existing tag" 错误
+            # 当 Fork 已存在同名标签时（如同一版本已同步过），git fetch --tags
+            # 会拒绝覆盖本地标签。--force 允许强制更新，确保与上游一致。
             for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
-              if git fetch upstream "refs/heads/${TARGET_BRANCH}:refs/remotes/upstream/${TARGET_BRANCH}" --tags --prune --prune-tags 2>/dev/null; then
-                FETCH_SUCCESS=true; break
-              fi
+              FETCH_ERROR=$(git fetch upstream "refs/heads/${TARGET_BRANCH}:refs/remotes/upstream/${TARGET_BRANCH}" --tags --prune --prune-tags --force 2>&1) && FETCH_SUCCESS=true || FETCH_ERROR_MSG="${FETCH_ERROR}"
+              if [ "${FETCH_SUCCESS}" = "true" ]; then break; fi
               echo "⚠️ 获取失败，第 ${i} 次重试..."
+              if [ "${{ env.DEBUG }}" = "true" ] || [ $i -eq ${{ env.API_RETRY_COUNT }} ]; then
+                echo "📄 错误详情：${FETCH_ERROR_MSG}"
+              fi
               if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
             done
 
             if [ "${FETCH_SUCCESS}" = "false" ]; then
-              echo "❌ 获取上游默认分支失败"
+              echo "❌ 获取上游默认分支失败（已重试 ${{ env.API_RETRY_COUNT }} 次）"
               echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+              # 累计错误但 exit 0：不阻断后续 Step 4 的 Release 同步
               exit 0
             fi
             echo "✅ 默认分支获取成功"
@@ -252,20 +294,124 @@ jobs:
             SYNCED_BRANCHES=0; FAILED_BRANCHES=0
             echo "----------------------------------------------"
             echo "🔄 同步分支：${TARGET_BRANCH}"
+            echo "📌 同步策略：${{ env.SYNC_STRATEGY }}"
 
-            if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
-              echo "⚠️ 本地分支 ${TARGET_BRANCH} 已存在，重置为上游版本..."
-              git checkout "${TARGET_BRANCH}"
-              git reset --hard "upstream/${TARGET_BRANCH}"
+            # ---- 备份需要保留的自定义文件（merge 失败时安全网） ----
+            # V8 改进：添加 trap 确保脚本异常退出时清理临时目录（main-only 模式）
+            PRESERVE_DIR=$(mktemp -d)
+            trap "rm -rf '${PRESERVE_DIR}'" EXIT
+            PRESERVE_COUNT=0
+            for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+              if [ -d "${preserve_path}" ] || [ -f "${preserve_path}" ]; then
+                target_dir="${PRESERVE_DIR}/$(dirname "${preserve_path}")"
+                mkdir -p "${target_dir}"
+                cp -r "${preserve_path}" "${PRESERVE_DIR}/${preserve_path}" 2>/dev/null && \
+                  echo "  📦 已备份: ${preserve_path}" && \
+                  PRESERVE_COUNT=$((PRESERVE_COUNT + 1)) || \
+                  echo "  ⚠️ 备份失败: ${preserve_path}"
+              fi
+            done
+            if [ "${PRESERVE_COUNT}" -gt 0 ]; then
+              echo "✅ 已备份 ${PRESERVE_COUNT} 个自定义路径"
             else
-              echo "📥 创建新分支 ${TARGET_BRANCH}..."
-              git checkout -b "${TARGET_BRANCH}" "upstream/${TARGET_BRANCH}"
+              echo "ℹ️ 没有需要备份的自定义路径"
             fi
 
-            if [ $? -ne 0 ]; then
+            # V8 改进：使用 BRANCH_OP_OK 显式追踪分支操作是否成功，
+            # 替代 V7 中脆弱的 $? 检查。MERGE_SUCCESS 显式追踪 merge 是否成功
+            # （true=merge 已保留 Fork 独有文件无需恢复，false=需要智能恢复）
+            BRANCH_OP_OK=true
+            MERGE_SUCCESS=false
+
+            if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
+              echo "⚠️ 本地分支 ${TARGET_BRANCH} 已存在"
+
+              if [ "${{ env.SYNC_STRATEGY }}" = "merge" ]; then
+                # ---- merge 策略：git merge upstream（默认，推荐） ----
+                # 效果：上游更新正常传入，Fork 独有文件被保留
+                echo "🔀 使用 git merge 策略（保留 Fork 独有文件，上游冲突以上游为准）..."
+                if ! git checkout "${TARGET_BRANCH}"; then
+                  echo "❌ 切换到分支 ${TARGET_BRANCH} 失败"
+                  BRANCH_OP_OK=false
+                else
+                  if git merge "upstream/${TARGET_BRANCH}" -X theirs --no-edit 2>/dev/null; then
+                    MERGE_SUCCESS=true
+                    echo "✅ git merge 成功（Fork 独有文件已自动保留）"
+                  else
+                    echo "⚠️ git merge 失败（可能存在冲突），回退到 reset + 智能恢复..."
+                    git merge --abort 2>/dev/null || true
+                    if ! git reset --hard "upstream/${TARGET_BRANCH}"; then
+                      echo "❌ git reset --hard 也失败了"
+                      BRANCH_OP_OK=false
+                    else
+                      echo "🔄 已回退为 reset --hard，将执行智能恢复..."
+                    fi
+                  fi
+                fi
+              else
+                # ---- reset 策略：完全覆盖为上游版本（旧行为） ----
+                echo "🔄 使用 reset 策略（完全覆盖为上游版本）..."
+                if ! git checkout "${TARGET_BRANCH}"; then
+                  echo "❌ 切换到分支 ${TARGET_BRANCH} 失败"
+                  BRANCH_OP_OK=false
+                elif ! git reset --hard "upstream/${TARGET_BRANCH}"; then
+                  echo "❌ git reset --hard 失败"
+                  BRANCH_OP_OK=false
+                else
+                  MERGE_SUCCESS=false
+                fi
+              fi
+            else
+              echo "📥 创建新分支 ${TARGET_BRANCH}（首次同步）..."
+              if ! git checkout -b "${TARGET_BRANCH}" "upstream/${TARGET_BRANCH}"; then
+                echo "❌ 创建分支 ${TARGET_BRANCH} 失败"
+                BRANCH_OP_OK=false
+              else
+                # V8：新分支创建时上游覆盖了工作区，标记需要智能恢复
+                # 确保 Fork 独有的 PRESERVE_PATHS 文件不被丢失
+                MERGE_SUCCESS=false
+              fi
+            fi
+
+            if [ "${BRANCH_OP_OK}" = "false" ]; then
               echo "❌ 分支 ${TARGET_BRANCH} 操作失败"
               FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
+              rm -rf "${PRESERVE_DIR}"
+              trap - EXIT
             else
+              # ---- 智能恢复（merge 未生效或未执行时触发，恢复 fork 独有文件） ----
+              if [ "${MERGE_SUCCESS}" != "true" ] && [ -d "${PRESERVE_DIR}" ] && [ "${PRESERVE_COUNT}" -gt 0 ]; then
+                echo "----------------------------------------------"
+                echo "📦 智能恢复：仅恢复上游中不存在的 Fork 独有文件..."
+                for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+                  backup_item="${PRESERVE_DIR}/${preserve_path}"
+                  if [ -d "${backup_item}" ]; then
+                    while IFS= read -r f; do
+                      relative="${f#${PRESERVE_DIR}/}"
+                      if [ ! -e "${relative}" ]; then
+                        dir=$(dirname "${relative}")
+                        mkdir -p "${dir}"
+                        cp "${f}" "${relative}" 2>/dev/null && \
+                          echo "  ✅ 已恢复: ${relative}（上游无此文件）"
+                      fi
+                    done < <(find "${backup_item}" -type f 2>/dev/null)
+                  elif [ -f "${backup_item}" ]; then
+                    if [ ! -e "${preserve_path}" ]; then
+                      mkdir -p "$(dirname "${preserve_path}")"
+                      cp "${backup_item}" "${preserve_path}" 2>/dev/null && \
+                        echo "  ✅ 已恢复: ${preserve_path}（上游无此文件）"
+                    fi
+                  fi
+                done
+                git add -A
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: preserve fork-only custom files after upstream sync [skip ci]" || true
+                  echo "✅ Fork 独有文件已提交"
+                else
+                  echo "ℹ️ 没有需要恢复的文件"
+                fi
+              fi
+
               PUSH_SUCCESS=false
               for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
                 if git push origin "${TARGET_BRANCH}" --force-with-lease; then
@@ -282,22 +428,28 @@ jobs:
                 FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
               fi
             fi
+            rm -rf "${PRESERVE_DIR}"
+            trap - EXIT
 
           else
             # ---- 完整模式：fetch 所有分支 + 所有标签 ----
             echo "📥 获取上游所有分支和标签..."
             FETCH_SUCCESS=false
+            # V8 修复：添加 --force 防止 "would clobber existing tag" 错误
             for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
-              if git fetch upstream --tags --prune --prune-tags; then
-                FETCH_SUCCESS=true; break
-              fi
+              FETCH_ERROR=$(git fetch upstream --tags --prune --prune-tags --force 2>&1) && FETCH_SUCCESS=true || FETCH_ERROR_MSG="${FETCH_ERROR}"
+              if [ "${FETCH_SUCCESS}" = "true" ]; then break; fi
               echo "⚠️ 获取上游全部分支失败，第 ${i} 次重试..."
+              if [ "${{ env.DEBUG }}" = "true" ] || [ $i -eq ${{ env.API_RETRY_COUNT }} ]; then
+                echo "📄 错误详情：${FETCH_ERROR_MSG}"
+              fi
               if [ $i -lt ${{ env.API_RETRY_COUNT }} ]; then sleep 5; fi
             done
 
             if [ "${FETCH_SUCCESS}" = "false" ]; then
-              echo "❌ 获取上游全部分支最终失败"
+              echo "❌ 获取上游全部分支最终失败（已重试 ${{ env.API_RETRY_COUNT }} 次）"
               echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+              # 累计错误但 exit 0：不阻断后续 Step 4 的 Release 同步
               exit 0
             fi
 
@@ -312,29 +464,126 @@ jobs:
               echo "----------------------------------------------"
               echo "🔄 处理分支：${branch_name}"
 
+              # ---- 每个分支重置状态变量 ----
+              MERGE_SUCCESS=false
+              PRESERVE_COUNT=0
+
+              # ---- 判断是否为默认分支，默认分支需要备份自定义文件 ----
+              IS_DEFAULT=false
+              PRESERVE_DIR=""
+              if [ "${branch_name}" = "${{ env.DEFAULT_BRANCH }}" ]; then
+                IS_DEFAULT=true
+                PRESERVE_DIR=$(mktemp -d)
+                for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+                  if [ -d "${preserve_path}" ] || [ -f "${preserve_path}" ]; then
+                    target_dir="${PRESERVE_DIR}/$(dirname "${preserve_path}")"
+                    mkdir -p "${target_dir}"
+                    cp -r "${preserve_path}" "${PRESERVE_DIR}/${preserve_path}" 2>/dev/null && \
+                      echo "  📦 已备份: ${preserve_path}" && \
+                      PRESERVE_COUNT=$((PRESERVE_COUNT + 1)) || \
+                      echo "  ⚠️ 备份失败: ${preserve_path}"
+                  fi
+                done
+                if [ "${PRESERVE_COUNT}" -gt 0 ]; then
+                  echo "✅ 已备份 ${PRESERVE_COUNT} 个自定义路径"
+                else
+                  echo "ℹ️ 没有需要备份的自定义路径"
+                fi
+              fi
+
+              # V8 改进：使用 BRANCH_OP_OK 显式追踪操作状态
+              BRANCH_OP_OK=true
+
               if git show-ref --verify --quiet "refs/heads/${branch_name}"; then
                 if [ "${{ env.FORCE_OVERWRITE_BRANCHES }}" = "true" ]; then
                   echo "⚠️ 本地分支已存在，强制覆盖..."
-                  if ! git checkout -B "${branch_name}" "upstream/${branch_name}"; then
-                    echo "❌ 强制覆盖分支 ${branch_name} 失败"
-                    FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); continue
+
+                  if [ "${IS_DEFAULT}" = "true" ] && [ "${{ env.SYNC_STRATEGY }}" = "merge" ]; then
+                    echo "🔀 默认分支使用 git merge 策略..."
+                    if git checkout "${branch_name}" && \
+                       git merge "upstream/${branch_name}" -X theirs --no-edit 2>/dev/null; then
+                      MERGE_SUCCESS=true
+                      echo "✅ git merge 成功（Fork 独有文件已自动保留）"
+                    else
+                      echo "⚠️ git merge 失败，回退到 reset + 智能恢复..."
+                      git merge --abort 2>/dev/null || true
+                      git checkout -B "${branch_name}" "upstream/${branch_name}" || {
+                        echo "❌ 强制覆盖分支 ${branch_name} 失败"
+                        FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"; continue
+                      }
+                      MERGE_SUCCESS=false
+                    fi
+                  elif [ "${IS_DEFAULT}" = "true" ]; then
+                    echo "🔄 默认分支使用 reset 策略..."
+                    if ! git checkout -B "${branch_name}" "upstream/${branch_name}"; then
+                      echo "❌ 强制覆盖分支 ${branch_name} 失败"
+                      FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"; continue
+                    fi
+                    MERGE_SUCCESS=false
+                  else
+                    if ! git checkout -B "${branch_name}" "upstream/${branch_name}"; then
+                      echo "❌ 强制覆盖分支 ${branch_name} 失败"
+                      FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"; continue
+                    fi
+                    MERGE_SUCCESS=true
                   fi
                 else
                   echo "⏭️ 本地分支已存在，跳过（如需覆盖请设置 FORCE_OVERWRITE_BRANCHES=true）"
-                  SKIPPED_BRANCHES=$((SKIPPED_BRANCHES + 1)); continue
+                  SKIPPED_BRANCHES=$((SKIPPED_BRANCHES + 1))
+                  [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"
+                  continue
                 fi
               else
                 echo "📥 创建并同步新分支..."
                 if ! git checkout -b "${branch_name}" "upstream/${branch_name}"; then
                   echo "❌ 创建分支 ${branch_name} 失败"
-                  FAILED_BRANCHES=$((FAILED_BRANCHES + 1)); continue
+                  FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
+                  [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"
+                  continue
+                fi
+                # 默认分支需触发智能恢复保留 Fork 独有文件；非默认分支无文件需保留
+                if [ "${IS_DEFAULT}" = "true" ]; then
+                  MERGE_SUCCESS=false
+                else
+                  MERGE_SUCCESS=true
+                fi
+              fi
+
+              # ---- 默认分支：智能恢复 Fork 独有文件（merge 未生效或未执行时触发） ----
+              if [ "${IS_DEFAULT}" = "true" ] && [ "${MERGE_SUCCESS}" != "true" ] && [ -d "${PRESERVE_DIR}" ]; then
+                for preserve_path in ${{ env.PRESERVE_PATHS }}; do
+                  backup_item="${PRESERVE_DIR}/${preserve_path}"
+                  if [ -d "${backup_item}" ]; then
+                    while IFS= read -r f; do
+                      relative="${f#${PRESERVE_DIR}/}"
+                      if [ ! -e "${relative}" ]; then
+                        dir=$(dirname "${relative}")
+                        mkdir -p "${dir}"
+                        cp "${f}" "${relative}" 2>/dev/null && \
+                          echo "  ✅ 已恢复: ${relative}（上游无此文件）"
+                      fi
+                    done < <(find "${backup_item}" -type f 2>/dev/null)
+                  elif [ -f "${backup_item}" ]; then
+                    if [ ! -e "${preserve_path}" ]; then
+                      mkdir -p "$(dirname "${preserve_path}")"
+                      cp "${backup_item}" "${preserve_path}" 2>/dev/null && \
+                        echo "  ✅ 已恢复: ${preserve_path}（上游无此文件）"
+                    fi
+                  fi
+                done
+                git add -A
+                if ! git diff --cached --quiet; then
+                  git commit -m "chore: preserve fork-only custom files after upstream sync [skip ci]" || true
+                  echo "✅ Fork 独有文件已提交"
+                else
+                  echo "ℹ️ 没有需要恢复的文件"
                 fi
               fi
 
               echo "📤 推送到本地仓库..."
               PUSH_SUCCESS=false
               for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
-                if git push origin "${branch_name}"; then
+                if git push origin "${branch_name}" --force-with-lease; then
                   PUSH_SUCCESS=true; break
                 fi
                 echo "⚠️ 推送 ${branch_name} 失败，第 ${i} 次重试..."
@@ -347,6 +596,8 @@ jobs:
                 echo "❌ 推送 ${branch_name} 最终失败"
                 FAILED_BRANCHES=$((FAILED_BRANCHES + 1))
               fi
+
+              [ -n "${PRESERVE_DIR}" ] && rm -rf "${PRESERVE_DIR}"
             done
 
             if [ "${{ env.PRUNE_DELETED_BRANCHES }}" = "true" ]; then
@@ -371,6 +622,7 @@ jobs:
           echo "----------------------------------------------"
           echo "🔄 同步所有标签..."
           TAG_PUSH_SUCCESS=false; FAILED_TAGS=0
+          # 使用 --force 确保本地标签与上游完全一致
           for i in $(seq 1 ${{ env.API_RETRY_COUNT }}); do
             if git push origin --tags --force; then
               TAG_PUSH_SUCCESS=true; break
@@ -456,6 +708,7 @@ jobs:
             echo "⚠️ 未能获取到上游 Release 列表"
             echo "💡 可能原因：1.上游无Release 2.网络/API限流 3.PAT权限不足"
             echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+            # 累计错误但 exit 0：上游可能确实没有 Release，非致命错误
             exit 0
           fi
 
@@ -526,6 +779,17 @@ jobs:
             if [ "${{ env.SYNC_PRERELEASES }}" = "false" ] && [ "${is_prerelease}" = "true" ]; then
               echo "⏭️ 跳过预发布版本"; increment_stat 2; continue
             fi
+
+            # ============================================================
+            # 删除重建策略：无条件删除 Fork 已有同名 Release，从上游重新下载创建
+            #
+            # 设计决策（V8 终版）：选择「删除重建」而非「比对跳过」，原因：
+            #   1. 正确性：比对永远存在漏检可能（同名附件替换、大小恰好相同等）
+            #      删除重建是数学上 100% 与上游一致的唯一方案
+            #   2. API 开销可忽略：每次同步 2~4 次写 API，远低于 5000 次/小时的限额
+            #   3. 代码简洁：3 行逻辑 vs 35 行比对，维护成本不成比例
+            #   4. 幂等性：重复执行结果不变，不依赖外部状态判断
+            # ============================================================
 
             # ---- 清理已存在的同名 Release（三重保障） ----
             echo "🗑️ 检查并清理已存在的 Release 和标签..."
@@ -661,7 +925,9 @@ jobs:
 
           if [ "${GET_SUCCESS}" != "true" ]; then
             echo "❌ 获取本地 Release 列表失败，跳过清理步骤"
-            echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt; exit 0
+            echo $(( $(cat /tmp/error_count.txt) + 1 )) > /tmp/error_count.txt
+            # 累计错误但 exit 0：清理是辅助功能，失败不阻断整体流程
+            exit 0
           fi
 
           TOTAL_COUNT=$(echo "${ALL_RELEASES}" | jq 'length')
